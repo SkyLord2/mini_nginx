@@ -1,57 +1,61 @@
-use std::net::{ Ipv4Addr, SocketAddrV4, TcpListener};
-use std::fs;
-use std::io::prelude::*;
-fn establish_server(ip: Ipv4Addr, port: u16) {
-    let listener = TcpListener::bind(SocketAddrV4::new(ip, port))
-    .unwrap_or_else(|err| {
-        eprintln!("listen ip address error: {}", err);
-        std::process::exit(1);
-    });
-    
-    listener.incoming()
-    .filter_map(|stream_rt| {
-        stream_rt.map_err(|e| eprintln!("Connection established failed: {}!", e)).ok() 
-    })
-    .for_each(|mut stream| {
-        println!("New connection established!");
-        let mut buffer = [0; 1024];
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs;
 
-        match stream.read(&mut buffer) {
-            Ok(size) => {
-                let req_str = String::from_utf8_lossy(&buffer[..size]);
-                // 打印第一行请求来看看（方便调试）
-                // lines().next() 取出第一行，比如 "GET / HTTP/1.1"
-                println!("Request: {:?}", req_str.lines().next().unwrap_or(""));
+// 1. 处理客户端逻辑现在是 async 的
+async fn handle_client(mut stream: TcpStream) {
+    let mut buffer = [0; 1024];
 
-                // 简单的路由逻辑
-                let (status_line, content) = if req_str.starts_with("GET / HTTP/1.1") {
-                    // 1. 如果是访问根目录，读取 index.html
-                    let content = fs::read_to_string("index.html").unwrap_or_else(|_| String::from("File not found"));
-                    ("HTTP/1.1 200 OK", content)
-                } else {
-                    // 2. 否则返回 404
-                    ("HTTP/1.1 404 NOT FOUND", String::from("<h1>404 Not Found</h1>"))
-                };
+    // 2. read 操作变成了异步的，必须加 .await
+    match stream.read(&mut buffer).await {
+        Ok(size) => {
+            if size == 0 { return; } // 连接可能关闭了
 
-                // 3. 拼接 HTTP 响应
-                let response = format!(
-                    "{}\r\nContent-Length: {}\r\n\r\n{}",
-                    status_line,
-                    content.len(),
-                    content
-                );
+            let req_str = String::from_utf8_lossy(&buffer[..size]);
+            let first_line = req_str.lines().next().unwrap_or("");
+            println!("Request: {:?}", first_line);
 
-                // 4. 发送
-                if let Err(e) = stream.write_all(response.as_bytes()) {
-                    eprintln!("Failed to send response: {}", e);
+            let (status_line, content) = if first_line == "GET / HTTP/1.1" {
+                // 3. 读取文件也是异步的，不阻塞线程
+                match fs::read_to_string("index.html").await {
+                    Ok(content) => ("HTTP/1.1 200 OK", content),
+                    Err(_) => ("HTTP/1.1 404 NOT FOUND", String::from("<h1>File not found</h1>")),
                 }
-            },
-            Err(error) => {
-                eprintln!("read buffer from stream error: {}", error);
+            } else {
+                ("HTTP/1.1 404 NOT FOUND", String::from("<h1>404 Not Found</h1>"))
+            };
+
+            let response = format!(
+                "{}\r\nContent-Length: {}\r\n\r\n{}",
+                status_line,
+                content.len(),
+                content
+            );
+
+            // 4. write 操作也是异步的
+            if let Err(e) = stream.write_all(response.as_bytes()).await {
+                eprintln!("Failed to send response: {}", e);
             }
         }
-    });
+        Err(e) => eprintln!("failed to read from socket: {}", e),
+    }
 }
-fn main() {
-    establish_server(Ipv4Addr::new(127, 0, 0, 1), 8080);
+
+// 5. main 函数变成了 async，并使用了 tokio 的宏
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "127.0.0.1:8080";
+    let listener = TcpListener::bind(addr).await?;
+    println!("Async Server listening on {}", addr);
+
+    loop {
+        // 6. accept 也是异步的
+        let (stream, _) = listener.accept().await?;
+
+        // 7. 使用 tokio::spawn 而不是 std::thread::spawn
+        // 这创建的是一个轻量级的“任务”，而不是系统线程
+        tokio::spawn(async move {
+            handle_client(stream).await;
+        });
+    }
 }
