@@ -19,48 +19,107 @@ fn get_mime_type(filename: &str) -> &str {
 async fn handle_client(mut stream: TcpStream) {
     let mut buffer = [0; 1024];
 
-    match stream.read(&mut buffer).await {
-        Ok(size) => {
-            if size == 0 { return; }
+    // 1. 先读一次，看看用户想要什么
+    let size = match stream.read(&mut buffer).await {
+        Ok(n) if n == 0 => return,
+        Ok(n) => n,
+        Err(_) => return,
+    };
 
-            let req_str = String::from_utf8_lossy(&buffer[..size]);
-            let first_line = req_str.lines().next().unwrap_or("");
-            // 解析请求路径，例如 "GET /index.html HTTP/1.1" -> "/index.html"
-            let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+    let req_str = String::from_utf8_lossy(&buffer[..size]);
+    let first_line = req_str.lines().next().unwrap_or("");
+    let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+    println!("Request: {} (Path: {})", first_line, path);
+
+    if path.starts_with("/proxy") {
+        handle_reverse_proxy(&mut stream, &mut buffer, size).await;
+    } else {
+        handle_static_file(&mut stream, &mut buffer, size).await;
+    }
+
+}
+
+async fn handle_reverse_proxy(stream: &mut TcpStream, buffer: &mut [u8], size: usize) {  
+    println!("--> Forwarding to upstream (Port 9000)...");
+
+    // 连接后端服务器 (Upstream)
+    match TcpStream::connect("127.0.0.1:9000").await {
+        Ok(mut upstream_stream) => {
+            // 1. 把原始请求转成字符串
+            let request_text = String::from_utf8_lossy(&buffer[..size]);
             
-            // 安全处理：如果请求 "/", 默认指向 "index.html"
-            let filename = if path == "/" { "index.html" } else { &path[1..] }; // 去掉开头的 /
-
-            println!("Request: {} -> File: {}", first_line, filename);
-
-            // 统一处理文件读取
-            let (status_line, content_type, content) = match fs::read(filename).await {
-                Ok(content) => {
-                    ("HTTP/1.1 200 OK", get_mime_type(filename), content)
-                }
-                Err(_) => {
-                    // 404 时返回一段简单的 HTML 字节
-                    ("HTTP/1.1 404 NOT FOUND", "text/html", "<h1>404 Not Found</h1>".as_bytes().to_vec())
-                }
-            };
-
-            // 组装响应头
-            let header = format!(
-                "{}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
-                status_line, content_type, content.len()
-            );
-
-            // 发送头部
-            if let Err(e) = stream.write_all(header.as_bytes()).await {
-                eprintln!("write header error: {}", e);
+            // 2. 进行简单的路径替换：把 "GET /proxy" 替换成 "GET /"
+            // 这样 Python 收到的就是访问根目录的请求了
+            let new_request_text = request_text.replace("GET /proxy", "GET /");
+            
+            // 3. 发送修改后的请求给 Python
+            if let Err(e) = upstream_stream.write_all(new_request_text.as_bytes()).await {
+                eprintln!("Failed to write to upstream: {}", e);
                 return;
             }
-            // 发送内容（可能是图片二进制数据，也可能是文本）
-            if let Err(e) = stream.write_all(&content).await {
-                eprintln!("write body error: {}", e);
+
+            // B. 建立双向管道
+            // split() 把一个流拆成“读句柄”和“写句柄”，这样可以同时读写
+            let (mut client_read, mut client_write) = stream.split();
+            let (mut upstream_read, mut upstream_write) = upstream_stream.split();
+
+            // 管道 1: 客户端剩余数据 -> 后端
+            // 管道 2: 后端响应数据 -> 客户端
+            // join! 宏让这两个拷贝任务同时进行
+            let client_to_server = tokio::io::copy(&mut client_read, &mut upstream_write);
+            let server_to_client = tokio::io::copy(&mut upstream_read, &mut client_write);
+
+            match tokio::join!(client_to_server, server_to_client) {
+                (Ok(_), Ok(_)) => {},
+                (Err(e), _) | (_, Err(e)) => eprintln!("Proxy transfer error: {}", e),
             }
         }
-        Err(e) => eprintln!("failed to read from socket: {}", e),
+        Err(e) => {
+            eprintln!("Failed to connect to upstream: {}", e);
+            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\nUpstream down").await;
+        }
+    }
+}
+
+async fn handle_static_file(stream: &mut TcpStream, buffer: &mut [u8], size: usize) {
+    if size == 0 { return; }
+
+    let req_str = String::from_utf8_lossy(&buffer[..size]);
+    let first_line = req_str.lines().next().unwrap_or("");
+    // 解析请求路径，例如 "GET /index.html HTTP/1.1" -> "/index.html"
+    let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+    
+    // 安全处理：如果请求 "/", 默认指向 "index.html"
+    let filename = if path == "/" { "index.html" } else { &path[1..] }; // 去掉开头的 /
+
+    println!("Request: {} -> File: {}", first_line, filename);
+
+    // 统一处理文件读取
+    let (status_line, content_type, content) = match fs::read(filename).await {
+        Ok(content) => {
+            ("HTTP/1.1 200 OK", get_mime_type(filename), content)
+        }
+        Err(_) => {
+            // 404 时返回一段简单的 HTML 字节
+            ("HTTP/1.1 404 NOT FOUND", "text/html", "<h1>404 Not Found</h1>".as_bytes().to_vec())
+        }
+    };
+
+    // 组装响应头
+    let header = format!(
+        "{}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+        status_line, content_type, content.len()
+    );
+
+    // 发送头部
+    if let Err(e) = stream.write_all(header.as_bytes()).await {
+        eprintln!("write header error: {}", e);
+        return;
+    }
+    // 发送内容（可能是图片二进制数据，也可能是文本）
+    if let Err(e) = stream.write_all(&content).await {
+        eprintln!("write body error: {}", e);
     }
 }
 
