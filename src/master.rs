@@ -1,0 +1,59 @@
+use std::env;
+
+use tokio::fs;
+use tokio::process::{Child, Command};
+use tokio::time::{self, Duration};
+
+pub async fn run_master_process() -> Result<(), Box<dyn std::error::Error>> {
+    let worker_count = 4;
+    let self_exe = env::current_exe()?.to_string_lossy().to_string();
+    let config_path = "config.json";
+    let mut last_modified = fs::metadata(config_path).await?.modified()?;
+    let mut workers = spawn_workers(&self_exe, worker_count).await?;
+
+    println!("Master: Running. Modify '{}' to trigger reload.", config_path);
+
+    loop {
+        time::sleep(Duration::from_secs(1)).await;
+        match fs::metadata(config_path).await {
+            Ok(metadata) => {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > last_modified {
+                        println!("\n[!] Config change detected! Reloading...");
+                        last_modified = modified;
+
+                        for worker in &mut workers {
+                            worker.kill().await?;
+                        }
+                        match spawn_workers(&self_exe, worker_count).await {
+                            Ok(new_workers) => {
+                                workers = new_workers;
+                                println!("Master: New workers started successfully!");
+                            }
+                            Err(e) => eprintln!("Master: Failed to spawn workers: {}", e),
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("Master: Failed to watch config file: {}", err);
+            }
+        }
+    }
+}
+
+async fn spawn_workers(
+    exec_path: &str,
+    count: usize,
+) -> Result<Vec<Child>, Box<dyn std::error::Error>> {
+    println!("Master [{}] starting {} workers...", std::process::id(), count);
+    let mut children = Vec::new();
+    for _ in 0..count {
+        let child = Command::new(exec_path)
+            .arg("--worker")
+            .kill_on_drop(true)
+            .spawn()?;
+        children.push(child);
+    }
+    Ok(children)
+}
