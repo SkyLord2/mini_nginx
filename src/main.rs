@@ -1,11 +1,12 @@
 use std::env;
-use std::process::Command;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream, TcpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::fs;
+use tokio::time::{self, Duration};
+use tokio::process::{Child, Command};
 
 use serde::Deserialize;
 
@@ -167,6 +168,19 @@ fn create_listener(addr: &str) -> Result<TcpListener, Box<dyn std::error::Error>
     Ok(listener)
 }
 
+async fn spawn_workers(exec_path: &str, count: usize) -> Result<Vec<Child>, Box<dyn std::error::Error>> {
+    println!("Master [{}] starting {} workers...", std::process::id(), count);
+    let mut children = Vec::new();
+    for _ in 0..count {
+        let child = Command::new(exec_path)
+        .arg("--worker")
+        .kill_on_drop(true) // 父进程退出时，自动杀掉子进程
+        .spawn()?;
+        children.push(child);
+    }
+    Ok(children)
+}
+
 // 👷 Worker 逻辑：这就是我们之前写的服务器主循环
 async fn run_worker_process() -> Result<(), Box<dyn std::error::Error>> {
     let config_content = fs::read_to_string("config.json").await?;
@@ -191,31 +205,44 @@ async fn run_worker_process() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // 🤵 Master 逻辑：只负责管理
-fn run_master_process() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_master_process() -> Result<(), Box<dyn std::error::Error>> {
     // 假设我们要启动 4 个 Worker (通常等于 CPU 核心数)
     let worker_count = 4;
-    println!("Master [{}] starting {} workers...", std::process::id(), worker_count);
-
-    let mut children = Vec::new();
-
     // 获取当前程序自己的路径，为了能在子进程里再次启动自己
-    let self_exe = env::current_exe()?;
+    let self_exe = env::current_exe()?.to_string_lossy().to_string();
+    let config_path = "config.json";
+    let mut last_modified = fs::metadata(config_path).await?.modified()?;
+    let mut workers = spawn_workers(&self_exe, worker_count).await?;
+    
+    println!("Master: Running. Modify '{}' to trigger reload.", config_path);
 
-    for _ in 0..worker_count {
-        // 启动子进程，并传入 "--worker" 参数
-        let child = Command::new(&self_exe)
-            .arg("--worker")
-            .spawn()?;
-        children.push(child);
-    }
+    loop {
+        time::sleep(Duration::from_secs(1)).await;
+        match fs::metadata(config_path).await {
+            Ok(metadata) => {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > last_modified {
+                        println!("\n[!] Config change detected! Reloading...");
+                        last_modified = modified;
 
-    // Master 进入等待状态，防止主进程退出
-    // 在真正的 Nginx 里，这里会监控信号和子进程状态
-    for mut child in children {
-        child.wait()?;
-    }
-
-    Ok(())
+                        for worker in &mut workers {
+                            worker.kill().await?;
+                        }
+                        match spawn_workers(&self_exe, worker_count).await {
+                            Ok(new_workers) => {
+                                workers = new_workers;
+                                println!("Master: New workers started successfully!");
+                            }
+                            Err(e) => eprintln!("Master: Failed to spawn workers: {}", e),
+                        }
+                    }
+                }
+            },
+            Err(err) => {
+                eprintln!("Master: Failed to watch config file: {}", err);
+            }
+        }
+    }    
 }
 
 #[tokio::main]
@@ -229,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_worker_process().await?;
     } else {
         // 否则就当老板
-        run_master_process()?;
+        run_master_process().await?;
     }
 
     Ok(())
