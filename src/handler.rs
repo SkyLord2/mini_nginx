@@ -6,8 +6,9 @@ use tokio::net::TcpStream;
 
 use crate::config::AppConfig;
 use crate::mime::get_mime_type;
+use crate::pool::ConnectionPool;
 
-pub async fn handle_client(mut stream: TcpStream, config: Arc<AppConfig>) {
+pub async fn handle_client(mut stream: TcpStream, config: Arc<AppConfig>, pool: ConnectionPool) {
     let mut buffer = [0; 1024];
 
     let size = match stream.read(&mut buffer).await {
@@ -31,7 +32,7 @@ pub async fn handle_client(mut stream: TcpStream, config: Arc<AppConfig>) {
     }
 
     if let Some((route, upstream_addr)) = matched_upstream {
-        handle_reverse_proxy(&mut stream, &mut buffer, size, upstream_addr, route).await;
+        handle_reverse_proxy(&mut stream, &mut buffer, size, upstream_addr, route, pool).await;
     } else {
         handle_static_file(&mut stream, &mut buffer, size, &config.root_path).await;
     }
@@ -43,10 +44,11 @@ async fn handle_reverse_proxy(
     size: usize,
     upstream_addr: &str,
     route: &str,
+    pool: ConnectionPool,
 ) {
     println!("--> Forwarding to upstream (Port 9000)...");
 
-    match TcpStream::connect(upstream_addr).await {
+    match pool.get(upstream_addr).await {
         Ok(mut upstream_stream) => {
             let request_text = String::from_utf8_lossy(&buffer[..size]);
             let new_request_text = request_text.replace(&format!("GET {}", route), "GET /");
@@ -63,8 +65,15 @@ async fn handle_reverse_proxy(
             let server_to_client = tokio::io::copy(&mut upstream_read, &mut client_write);
 
             match tokio::join!(client_to_server, server_to_client) {
-                (Ok(_), Ok(_)) => {}
-                (Err(e), _) | (_, Err(e)) => eprintln!("Proxy transfer error: {}", e),
+                (Ok(_), Ok(_)) => {
+                    // 只有当 join 正常结束（通常意味着客户端断开了连接，或者 Upstream 关闭了）
+                    // 在 Keep-Alive 场景下，如果是客户端先断开，我们就可以回收 Upstream 连接供下一个人用
+                    pool.recycle(upstream_addr, upstream_stream);
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    // 出错了就不回收了，让它自动 Drop 关闭
+                    eprintln!("Proxy transfer error: {}", e);
+                },
             }
         }
         Err(e) => {

@@ -4,6 +4,7 @@ mod listener;
 mod master;
 mod mime;
 mod worker;
+mod pool;
 
 use std::env;
 
