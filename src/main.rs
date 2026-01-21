@@ -1,9 +1,22 @@
 use std::env;
 use std::process::Command;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream, TcpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::fs;
+
+use serde::Deserialize;
+
+// 定义配置结构体
+#[derive(Debug, Deserialize, Clone)]
+struct AppConfig {
+    listen_addr: String,
+    root_path: String,
+    // 使用 HashMap 来存储多条反向代理规则
+    upstreams: HashMap<String, String>, 
+}
 
 // 辅助函数：根据文件名获取 MIME 类型 (Content-Type)
 // 这是一个简单的 match，以后可以用 crate 替代
@@ -16,7 +29,7 @@ fn get_mime_type(filename: &str) -> &str {
     else { "application/octet-stream" } // 默认二进制流
 }
 
-async fn handle_client(mut stream: TcpStream) {
+async fn handle_client(mut stream: TcpStream, config: Arc<AppConfig>) {
     let mut buffer = [0; 1024];
 
     // 1. 先读一次，看看用户想要什么
@@ -32,26 +45,42 @@ async fn handle_client(mut stream: TcpStream) {
 
     println!("Request: {} (Path: {})", first_line, path);
 
-    if path.starts_with("/proxy") {
-        handle_reverse_proxy(&mut stream, &mut buffer, size).await;
+    // 🔥 使用 config.upstreams 动态查找代理规则
+    // 检查 path 是否匹配配置中的任何一个 key (例如 "/proxy")
+    let mut matched_upstream = None;
+    for (route, upstream_addr) in &config.upstreams {
+        if path.starts_with(route) {
+            matched_upstream = Some((route, upstream_addr));
+            break;
+        }
+    }
+
+    if let Some((route, upstream_addr)) = matched_upstream {
+        handle_reverse_proxy(&mut stream, &mut buffer, size, upstream_addr, route).await;
     } else {
-        handle_static_file(&mut stream, &mut buffer, size).await;
+        handle_static_file(&mut stream, &mut buffer, size, &config.root_path).await;
     }
 
 }
 
-async fn handle_reverse_proxy(stream: &mut TcpStream, buffer: &mut [u8], size: usize) {  
+async fn handle_reverse_proxy(
+    stream: &mut TcpStream, 
+    buffer: &mut [u8], 
+    size: usize, 
+    upstream_addr: &str,
+    route: &str,
+) {  
     println!("--> Forwarding to upstream (Port 9000)...");
 
     // 连接后端服务器 (Upstream)
-    match TcpStream::connect("127.0.0.1:9000").await {
+    match TcpStream::connect(upstream_addr).await {
         Ok(mut upstream_stream) => {
             // 1. 把原始请求转成字符串
             let request_text = String::from_utf8_lossy(&buffer[..size]);
             
             // 2. 进行简单的路径替换：把 "GET /proxy" 替换成 "GET /"
             // 这样 Python 收到的就是访问根目录的请求了
-            let new_request_text = request_text.replace("GET /proxy", "GET /");
+            let new_request_text = request_text.replace(&format!("GET {}", route), "GET /");
             
             // 3. 发送修改后的请求给 Python
             if let Err(e) = upstream_stream.write_all(new_request_text.as_bytes()).await {
@@ -82,7 +111,7 @@ async fn handle_reverse_proxy(stream: &mut TcpStream, buffer: &mut [u8], size: u
     }
 }
 
-async fn handle_static_file(stream: &mut TcpStream, buffer: &mut [u8], size: usize) {
+async fn handle_static_file(stream: &mut TcpStream, buffer: &mut [u8], size: usize, root_path: &str) {
     if size == 0 { return; }
 
     let req_str = String::from_utf8_lossy(&buffer[..size]);
@@ -92,11 +121,13 @@ async fn handle_static_file(stream: &mut TcpStream, buffer: &mut [u8], size: usi
     
     // 安全处理：如果请求 "/", 默认指向 "index.html"
     let filename = if path == "/" { "index.html" } else { &path[1..] }; // 去掉开头的 /
+    // 这里可以拼接路径，简单起见我们直接用 string 拼接
+    let file_path = format!("{}/{}", root_path, filename);
 
     println!("Request: {} -> File: {}", first_line, filename);
 
     // 统一处理文件读取
-    let (status_line, content_type, content) = match fs::read(filename).await {
+    let (status_line, content_type, content) = match fs::read(file_path).await {
         Ok(content) => {
             ("HTTP/1.1 200 OK", get_mime_type(filename), content)
         }
@@ -138,7 +169,11 @@ fn create_listener(addr: &str) -> Result<TcpListener, Box<dyn std::error::Error>
 
 // 👷 Worker 逻辑：这就是我们之前写的服务器主循环
 async fn run_worker_process() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "127.0.0.1:8080";
+    let config_content = fs::read_to_string("config.json").await?;
+    let config: AppConfig = serde_json::from_str(&config_content)?;
+    let shared_config = Arc::new(config);
+    
+    let addr = shared_config.listen_addr.as_str();
     // 使用新的 helper 函数
     let listener = create_listener(addr)?;
     
@@ -148,8 +183,9 @@ async fn run_worker_process() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let config_clone = shared_config.clone();
         tokio::spawn(async move {
-            handle_client(stream).await;
+            handle_client(stream, config_clone).await;
         });
     }
 }
