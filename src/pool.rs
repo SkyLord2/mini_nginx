@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use crate::config::PoolConfig;
+
 #[derive(Clone)]
 pub struct ConnectionPool {
     state: Arc<Mutex<PoolState>>,
@@ -23,15 +25,15 @@ struct PooledConn {
 }
 
 impl ConnectionPool {
-    pub fn new() -> Self {
+    pub fn new_with_config(config: &PoolConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(PoolState {
                 conns: HashMap::new(),
                 total: 0,
             })),
-            max_size: 128,
-            max_idle: Duration::from_secs(60),
-            probe_timeout: Duration::from_millis(200),
+            max_size: config.max_size,
+            max_idle: Duration::from_secs(config.max_idle_secs),
+            probe_timeout: Duration::from_millis(config.probe_timeout_ms),
         }
     }
 

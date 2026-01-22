@@ -5,5 +5,10 @@
     "/proxy": "127.0.0.1:9000",
     "/api": "127.0.0.1:9001",
     "/files": "127.0.0.1:9000"
+  },
+  "pool": {
+    "max_size": 128,
+    "max_idle_secs": 60,
+    "probe_timeout_ms": 200
   }
 }

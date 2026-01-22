@@ -9,8 +9,7 @@ pub async fn run_worker_process() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config("config.json").await?;
     let shared_config = Arc::new(config);
 
-    // 🔥 初始化连接池
-    let connection_pool = ConnectionPool::new();
+    let connection_pool = ConnectionPool::new_with_config(&shared_config.pool);
 
     let addr = shared_config.listen_addr.as_str();
     let listener = create_listener(addr)?;
