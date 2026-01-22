@@ -1,11 +1,12 @@
 use std::env;
+use std::thread;
 
 use tokio::fs;
 use tokio::process::{Child, Command};
 use tokio::time::{self, Duration};
 
 pub async fn run_master_process() -> Result<(), Box<dyn std::error::Error>> {
-    let worker_count = 4;
+    let worker_count = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let self_exe = env::current_exe()?.to_string_lossy().to_string();
     let config_path = "config.json";
     let mut last_modified = fs::metadata(config_path).await?.modified()?;
